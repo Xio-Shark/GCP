@@ -1,0 +1,23 @@
+{
+  "include": [
+    "**/*.py"
+  ],
+  "exclude": [
+    "**/__pycache__",
+    "**/.pytest_cache",
+    "**/node_modules",
+    "**/.git",
+    "**/build",
+    "3rdparty/**"
+  ],
+  "typeStubPath": "typings",
+  "reportMissingImports": "warning",
+  "reportMissingTypeStubs": "warning",
+  "reportOptionalMemberAccess": "warning",
+  "reportOptionalIterable": "warning",
+  "reportOptionalContexualreturn": "warning",
+  "reportOptionalCall": "warning",
+  "reportOptionalOperand": "warning",
+  "reportOptionalAttribute": "warning",
+  "reportOptionalSubscript": "warning"
+}
