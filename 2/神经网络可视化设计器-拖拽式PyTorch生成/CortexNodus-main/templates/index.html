@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="zh-cn">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>CortexNodus</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <script src="https://unpkg.com/litegraph.js/build/litegraph.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="title">CortexNodus</div>
+      <div class="actions">
+        <button id="btn-new">新建</button>
+        <button id="btn-open">打开</button>
+        <button id="btn-save">保存</button>
+        <button id="btn-save-as">另存为</button>
+        <button id="btn-run">运行训练</button>
+        <button id="btn-gen">生成脚本</button>
+        <button id="btn-export-app">导出应用</button>
+        <button id="btn-autolayout">自动布局</button>
+        <input type="file" id="open-file-input" style="display:none" accept=".json">
+      </div>
+      <div class="file-info">
+        <span id="current-file">未保存的文件</span>
+      </div>
+    </header>
+
+    <main class="layout">
+      <aside class="palette">
+        <h3>节点库</h3>
+        <input type="text" id="node-search" placeholder="搜索节点..." style="width: 100%; margin-bottom: 10px; padding: 6px; background: #1a1a1a; color: #eaeaea; border: 1px solid #444;">
+        <div class="group">数据</div>
+        <button class="node" data-type="MNIST">MNIST</button>
+        <button class="node" data-type="Fashion-MNIST">Fashion-MNIST</button>
+        <button class="node" data-type="CIFAR-10">CIFAR-10</button>
+        <button class="node" data-type="WikiText-2">WikiText-2</button>
+        <button class="node" data-type="WikiText-103">WikiText-103</button>
+        <button class="node" data-type="PennTreebank">Penn Treebank</button>
+        <button class="node" data-type="CustomData">Custom Data</button>
+        
+        <div class="group">卷积与池化</div>
+        <button class="node" data-type="Conv2D">Conv2D</button>
+        <button class="node" data-type="ConvTranspose2d">ConvTranspose2d</button>
+        <button class="node" data-type="MaxPool">MaxPool</button>
+        <button class="node" data-type="AvgPool">AvgPool</button>
+        <button class="node" data-type="AdaptiveAvgPool">AdaptiveAvgPool</button>
+        <button class="node" data-type="Upsample">Upsample</button>
+        <button class="node" data-type="PixelShuffle">PixelShuffle</button>
+        <button class="node" data-type="ZeroPad2d">ZeroPad2d</button>
+        
+        <div class="group">激活函数</div>
+        <button class="node" data-type="ReLU">ReLU</button>
+        <button class="node" data-type="LeakyReLU">LeakyReLU</button>
+        <button class="node" data-type="PReLU">PReLU</button>
+        <button class="node" data-type="ELU">ELU</button>
+        <button class="node" data-type="GELU">GELU</button>
+        <button class="node" data-type="SiLU">SiLU</button>
+        <button class="node" data-type="Hardswish">Hardswish</button>
+        <button class="node" data-type="Hardsigmoid">Hardsigmoid</button>
+        <button class="node" data-type="Sigmoid">Sigmoid</button>
+        <button class="node" data-type="Tanh">Tanh</button>
+        <button class="node" data-type="Softplus">Softplus</button>
+        <button class="node" data-type="Softmax">Softmax</button>
+        <button class="node" data-type="LogSoftmax">LogSoftmax</button>
+        
+        <div class="group">核心层</div>
+        <button class="node" data-type="Dense">Dense</button>
+        <button class="node" data-type="Flatten">Flatten</button>
+        <button class="node" data-type="Dropout">Dropout</button>
+        <button class="node" data-type="Dropout2d">Dropout2d</button>
+        <button class="node" data-type="AlphaDropout">AlphaDropout</button>
+        <button class="node" data-type="BatchNorm2d">BatchNorm2d</button>
+        <button class="node" data-type="BatchNorm1d">BatchNorm1d</button>
+        <button class="node" data-type="InstanceNorm2d">InstanceNorm2d</button>
+        <button class="node" data-type="GroupNorm">GroupNorm</button>
+        <button class="node" data-type="LayerNorm">LayerNorm</button>
+        <button class="node" data-type="Identity">Identity</button>
+        
+        <div class="group">Transformer & NLP</div>
+        <button class="node" data-type="Embedding">Embedding</button>
+        <button class="node" data-type="PositionalEncoding">Positional Encoding</button>
+        <button class="node" data-type="GPTBlock">GPT Block</button>
+        <button class="node" data-type="TransformerEncoderLayer">Transformer Encoder Layer</button>
+        <button class="node" data-type="TransformerEncoder">Transformer Encoder</button>
+        <button class="node" data-type="TransformerDecoderLayer">Transformer Decoder Layer</button>
+        <button class="node" data-type="TransformerDecoder">Transformer Decoder</button>
+        <button class="node" data-type="MultiheadAttention">Multihead Attention</button>
+        <button class="node" data-type="Linear">Linear</button>
+        
+        <div class="group">合并操作</div>
+        <button class="node" data-type="Add">Add</button>
+        <button class="node" data-type="Multiply">Multiply</button>
+        <button class="node" data-type="Concat">Concat</button>
+        
+        <div class="group">自定义</div>
+        <button class="node" data-type="CustomLayer">Custom Layer</button>
+
+        <div class="group">内联子图</div>
+        <div id="embedded-subgraph-list" style="display: flex; flex-direction: column; gap: 5px; margin-bottom: 10px;"></div>
+        <button id="btn-new-embedded-subgraph" style="width: 100%;">+ 新建内联子图</button>
+
+
+        <div class="group">独立子图</div>
+        <div id="subgraph-list" style="display: flex; flex-direction: column; gap: 5px; margin-bottom: 10px;"></div>
+        <button id="btn-new-subgraph" style="width: 100%;">+ 新建子图</button>
+
+        <div class="group">训练</div>
+        <button class="node" data-type="Loss">Training Goal</button>
+      </aside>
+
+      <section class="canvas-wrap">
+        <div id="breadcrumbs" class="breadcrumbs" style="display: none;">
+          <span id="breadcrumb-path">Root</span>
+        </div>
+        <canvas id="graphcanvas" width="1000" height="700"></canvas>
+      </section>
+
+      <aside class="inspector">
+        <div class="tabs-header">
+            <button class="tab-btn active" data-tab="inspector-tab">属性</button>
+            <button class="tab-btn" data-tab="charts-tab">图表</button>
+            <button class="tab-btn" data-tab="logs-tab">日志</button>
+            <button class="tab-btn" data-tab="viz-tab">可视化</button>
+        </div>
+        
+        <div class="tabs-content">
+            <!-- 属性面板 -->
+            <div id="inspector-tab" class="tab-pane active">
+                <div id="inspector"></div>
+            </div>
+
+            <!-- 图表面板 -->
+            <div id="charts-tab" class="tab-pane">
+                <div id="charts-container" style="height: 100%; padding: 8px; display: flex; flex-direction: column; gap: 10px;">
+                    <div style="flex: 1; min-height: 0; position: relative;">
+                        <canvas id="loss-chart"></canvas>
+                    </div>
+                    <div style="flex: 1; min-height: 0; position: relative;">
+                        <canvas id="acc-chart"></canvas>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 日志面板 -->
+            <div id="logs-tab" class="tab-pane">
+                <div id="mini-log-container" style="display: flex; flex-direction: column; height: 100%;">
+                    <div style="padding: 8px;">
+                        <button id="btn-stop-training" style="width: 100%; background: #444; color: #aaa; border: none; padding: 8px 12px; border-radius: 4px; cursor: not-allowed; font-size: 13px; font-weight: bold;" disabled>终止训练</button>
+                        <div id="training-status-bar" style="font-size: 12px; color: #888; margin-top: 8px; font-family: monospace; text-align: center; padding: 4px; background: #2a2a2a; border-radius: 3px; border: 1px solid #444;">准备就绪</div>
+                    </div>
+                    <div id="mini-log" style="flex: 1; overflow-y: auto; background: #111; padding: 8px; font-family: 'Consolas', 'Monaco', monospace; font-size: 11px; color: #ccc; border: 1px solid #333; margin: 0 8px 8px 8px; border-radius: 4px;"></div>
+                </div>
+            </div>
+
+            <!-- 可视化面板 -->
+            <div id="viz-tab" class="tab-pane">
+                <div id="viz-container" style="padding: 8px; display: flex; flex-direction: column; gap: 10px; overflow-y: auto; height: 100%;">
+                    <div class="viz-item">
+                        <h4>损失曲线</h4>
+                        <img id="viz-loss-curve" src="" alt="等待训练..." style="width: 100%; border-radius: 4px; display: none;">
+                    </div>
+                    <div class="viz-item">
+                        <h4>混淆矩阵</h4>
+                        <img id="viz-confusion-matrix" src="" alt="等待训练..." style="width: 100%; border-radius: 4px; display: none;">
+                    </div>
+                    <div class="viz-item">
+                        <h4>预测样本</h4>
+                        <img id="viz-predictions" src="" alt="等待训练..." style="width: 100%; border-radius: 4px; display: none;">
+                    </div>
+                </div>
+            </div>
+        </div>
+      </aside>
+    </main>
+
+    <div id="run-modal" class="modal">
+      <div class="modal-content">
+        <span class="close">&times;</span>
+        <h3>训练运行中</h3>
+        <div id="modal-status-text">正在初始化...</div>
+        <pre id="modal-log"></pre>
+      </div>
+    </div>
+
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+    <script src="/static/designer.js"></script>
+  </body>
+</html>

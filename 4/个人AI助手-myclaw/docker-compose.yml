@@ -1,0 +1,30 @@
+services:
+  myclaw:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "18790:18790"
+      - "9876:9876"
+      - "9886:9886"
+    volumes:
+      - myclaw-data:/root/.myclaw
+    environment:
+      - MYCLAW_API_KEY=${MYCLAW_API_KEY}
+      - MYCLAW_TELEGRAM_TOKEN=${MYCLAW_TELEGRAM_TOKEN:-}
+      - MYCLAW_FEISHU_APP_ID=${MYCLAW_FEISHU_APP_ID:-}
+      - MYCLAW_FEISHU_APP_SECRET=${MYCLAW_FEISHU_APP_SECRET:-}
+      - MYCLAW_WECOM_TOKEN=${MYCLAW_WECOM_TOKEN:-}
+      - MYCLAW_WECOM_ENCODING_AES_KEY=${MYCLAW_WECOM_ENCODING_AES_KEY:-}
+      - MYCLAW_WECOM_RECEIVE_ID=${MYCLAW_WECOM_RECEIVE_ID:-}
+
+  # Optional: expose webhook via cloudflared tunnel
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    profiles: ["tunnel"]
+    command: tunnel --url http://myclaw:9876
+    depends_on:
+      - myclaw
+
+volumes:
+  myclaw-data:

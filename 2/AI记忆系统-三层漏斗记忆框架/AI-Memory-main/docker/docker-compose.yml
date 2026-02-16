@@ -1,0 +1,89 @@
+version: '3.8'
+
+services:
+  # ========== 应用服务 ==========
+  app:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: ai-memory-app
+    ports:
+      - "8080:8080"
+    env_file:
+      - ../.env
+    environment:
+      # 强制覆盖为容器内部服务地址，其余业务配置从 ../.env 自动加载
+      REDIS_ADDR: redis:6379
+      DB_HOST: mysql:3306
+      QDRANT_ADDR: qdrant:6334
+      VECTOR_STORE_PROVIDER: qdrant
+      LOG_DIR: /app/log
+    volumes:
+      - ai-memory-logs:/app/log
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      - ai-memory-network
+
+  # ========== Redis ==========
+  redis:
+    image: redis:7-alpine
+    container_name: ai-memory-redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - ai-memory-network
+
+  # ========== MySQL ==========
+  mysql:
+    image: mysql:8.0
+    container_name: ai-memory-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-ai_memory_secret}
+      MYSQL_DATABASE: ai_memory
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ../schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - ai-memory-network
+
+  # ========== Qdrant ==========
+  qdrant:
+    image: qdrant/qdrant:v1.13.0
+    container_name: ai-memory-qdrant
+    volumes:
+      - qdrant-data:/qdrant/storage
+    restart: unless-stopped
+    networks:
+      - ai-memory-network
+
+# ========== 数据卷 ==========
+volumes:
+  redis-data:
+  mysql-data:
+  qdrant-data:
+  ai-memory-logs:
+
+# ========== 网络 ==========
+networks:
+  ai-memory-network:
+    driver: bridge

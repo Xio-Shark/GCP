@@ -1,0 +1,539 @@
+package memory
+
+import (
+	"ai-memory/pkg/config"
+	"ai-memory/pkg/llm"
+	"ai-memory/pkg/logger"
+	"ai-memory/pkg/store"
+	"ai-memory/pkg/types"
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"sort"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// Manager implements the Memory interface.
+type Manager struct {
+	cfg          *config.Config
+	vectorStore  VectorStore
+	stmStore     ListStore
+	endUserStore EndUserStore
+	embedder     Embedder
+	llm          llm.LLM
+
+	// 漏斗型记忆组件
+	judge           *Judge
+	stagingStore    *store.StagingStore
+	decayCalculator *DecayCalculator
+	alertEngine     *AlertEngine // 告警引擎
+
+	// 后台任务控制
+	ctx     context.Context
+	cancel  context.CancelFunc
+	wg      sync.WaitGroup
+	monitor *PerformanceMonitor
+
+	// 数据库连接(供告警系统使用)
+	mysqlDB *sql.DB
+}
+
+func NewManager(cfg *config.Config, vStore VectorStore, lStore ListStore, uStore EndUserStore, embedder Embedder, llmModel llm.LLM, redisStore *store.RedisStore, mysqlDB *sql.DB) *Manager {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// 初始化漏斗组件
+	judge := NewJudge(llmModel, cfg.JudgeModel, cfg.ExtractTagsModel)
+	stagingStore := store.NewStagingStore(redisStore.GetClient(), 30) // TTL 30天
+	decayCalc := NewDecayCalculator(cfg.LTMDecayHalfLifeDays, cfg.LTMDecayMinScore)
+
+	m := &Manager{
+		cfg:             cfg,
+		vectorStore:     vStore,
+		stmStore:        lStore,
+		endUserStore:    uStore,
+		embedder:        embedder,
+		llm:             llmModel,
+		judge:           judge,
+		stagingStore:    stagingStore,
+		decayCalculator: decayCalc,
+		ctx:             ctx,
+		cancel:          cancel,
+		mysqlDB:         mysqlDB,
+	}
+
+	m.initPerformanceMonitor()
+
+	// 初始化告警引擎
+	alertConfig := &AlertConfig{
+		CheckIntervalMinutes: cfg.AlertCheckIntervalMinutes,
+		HistoryMaxSize:       cfg.AlertHistoryMaxSize,
+		// 智能缓存检测配置
+		CacheWindowMinutes:  cfg.AlertCacheWindowMinutes,
+		CacheMinSamples:     cfg.AlertCacheMinSamples,
+		CacheWarnThreshold:  cfg.AlertCacheWarnThreshold,
+		CacheErrorThreshold: cfg.AlertCacheErrorThreshold,
+		CacheTrendPeriods:   cfg.AlertCacheTrendPeriods,
+		// 注意：规则阈值和冷却时间现在从数据库的 alert_rule_configs 表读取
+	}
+	// 创建告警存储层
+	var alertRepo AlertRepository
+	if mysqlDB != nil {
+		alertRepo = NewMySQLAlertRepository(mysqlDB)
+	}
+	m.alertEngine = NewAlertEngine(alertRepo, GetGlobalMetrics(), stagingStore, alertConfig)
+
+	// 初始化规则配置持久化
+	if mysqlDB != nil {
+		if err := m.alertEngine.InitWithDB(ctx, mysqlDB); err != nil {
+			logger.Error("Failed to init alert engine with DB", err)
+		}
+	}
+
+	m.alertEngine.Start(ctx)
+
+	// 启动后台协程
+	m.startBackgroundTasks()
+
+	return m
+}
+
+type Filter struct {
+	UserID string
+	Type   string // "short_term", "long_term", "all"
+	Limit  int
+	Page   int
+}
+
+// Add stores a new interaction in Short-Term Memory (Redis).
+func (m *Manager) Add(ctx context.Context, userID string, sessionID string, input string, output string, metadata map[string]interface{}) error {
+	if metadata == nil {
+		metadata = make(map[string]interface{})
+	}
+	metadata["user_id"] = userID
+	metadata["session_id"] = sessionID
+
+	record := types.Record{
+		ID:        uuid.New().String(),
+		Content:   fmt.Sprintf("User: %s\nAI: %s", input, output),
+		Timestamp: time.Now(),
+		Metadata:  metadata,
+		Type:      types.ShortTerm,
+	}
+
+	data, err := json.Marshal(record)
+	if err != nil {
+		return fmt.Errorf("failed to marshal record: %w", err)
+	}
+
+	// Push to Redis List associated with User AND Session
+	key := fmt.Sprintf("memory:stm:%s:%s", userID, sessionID)
+	if err := m.stmStore.RPushWithExpire(ctx, key, m.cfg.STMExpirationDays, data); err != nil {
+		return fmt.Errorf("failed to add to STM: %w", err)
+	}
+
+	// Update EndUser Activity
+	if m.endUserStore != nil {
+		_ = m.endUserStore.UpsertUser(ctx, userID)
+	}
+
+	return nil
+}
+
+// Retrieve finds relevant memories from both STM (recent context) and LTM (vector search).
+func (m *Manager) Retrieve(ctx context.Context, userID string, sessionID string, query string, limit int) ([]types.Record, error) {
+	var allRecords []types.Record
+	key := fmt.Sprintf("memory:stm:%s:%s", userID, sessionID)
+
+	// 1. Fetch STM (Session Context)
+	stmData, err := m.stmStore.LRange(ctx, key, 0, -1)
+	if err == nil {
+		start := 0
+		if len(stmData) > m.cfg.ContextWindow {
+			start = len(stmData) - m.cfg.ContextWindow
+		}
+
+		for i := start; i < len(stmData); i++ {
+			var rec types.Record
+			if json.Unmarshal([]byte(stmData[i]), &rec) == nil {
+				allRecords = append(allRecords, rec)
+			}
+		}
+	}
+
+	// 2. Fetch Staging (Mid-term Context)
+	// These are summarized facts that haven't reached LTM yet.
+	// REFINED: Now uses session-based isolation.
+	stagingEntries, err := m.stagingStore.GetBySession(ctx, userID, sessionID)
+	if err == nil {
+		for _, entry := range stagingEntries {
+			// Convert StagingEntry to Record for uniform output
+			allRecords = append(allRecords, types.Record{
+				ID:        entry.ID,
+				Content:   entry.Content,
+				Timestamp: entry.LastSeenAt,
+				Type:      types.Staging,
+				Metadata: map[string]interface{}{
+					"category":         string(entry.Category),
+					"confidence_score": entry.ConfidenceScore,
+					"occurrence_count": entry.OccurrenceCount,
+					"source":           "staging",
+				},
+			})
+		}
+	}
+
+	// 3. Search LTM (User Context)
+	remainingSlots := limit
+	if m.cfg.MaxRecentMemories > 0 && limit > m.cfg.MaxRecentMemories {
+		remainingSlots = m.cfg.MaxRecentMemories
+	}
+
+	vector, err := m.embedder.EmbedQuery(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to embed query: %w", err)
+	}
+
+	// Filter by User ID (access to ALL past sessions)
+	filters := map[string]interface{}{
+		"user_id": userID,
+	}
+
+	ltmRecords, err := m.vectorStore.Search(ctx, vector, remainingSlots, 0.7, filters)
+	if err == nil {
+		allRecords = append(allRecords, ltmRecords...)
+
+		// [Proactive Self-Healing] Async Repair
+		// If we found multiple results, check if they are near-identical
+		if len(ltmRecords) > 1 {
+			go func(recs []types.Record, uid string) {
+				// Wait a bit or use a fresh context to avoid canceling with the request
+				repairCtx := context.Background()
+				for i := 0; i < len(recs); i++ {
+					for j := i + 1; j < len(recs); j++ {
+						sim := cosineSimilarity(recs[i].Embedding, recs[j].Embedding)
+						if sim > 0.98 {
+							logger.System("🔍 [Self-Healing] Found duplicate in recall, triggering repair", "user", uid)
+							// Trigger a targeted dedup/merge
+							strategy, mergedContent, err := m.judge.DecideMergeStrategy(repairCtx, recs[i].Content, recs[j].Content)
+							if err == nil && strategy != "keep_both" {
+								m.executeMergeStrategy(repairCtx, recs[i], recs[j], strategy, mergedContent)
+							}
+							return // Only trigger once per recall
+						}
+					}
+				}
+			}(ltmRecords, userID)
+		}
+	}
+
+	// Enforce global MaxRecentMemories
+	if m.cfg.MaxRecentMemories > 0 && len(allRecords) > m.cfg.MaxRecentMemories {
+		allRecords = allRecords[:m.cfg.MaxRecentMemories]
+	}
+
+	return allRecords, nil
+}
+
+// List retrieves all records with filtering.
+func (m *Manager) List(ctx context.Context, filter Filter) ([]types.Record, error) {
+	var results []types.Record
+
+	// Defaults
+	if filter.Limit <= 0 {
+		filter.Limit = 50
+	}
+	if filter.Page <= 0 {
+		filter.Page = 1
+	}
+
+	offset := (filter.Page - 1) * filter.Limit
+
+	// 1. Fetch Short-Term Memory if requested
+	if filter.Type == "short_term" || filter.Type == "all" || filter.Type == "" {
+		// If UserID is provided, search specific session keys
+		// Pattern: memory:stm:<UserID>:*
+		pattern := "memory:stm:*:*"
+		if filter.UserID != "" {
+			pattern = fmt.Sprintf("memory:stm:%s:*", filter.UserID)
+		}
+
+		keys, err := m.stmStore.ScanKeys(ctx, pattern)
+		if err == nil {
+			for _, key := range keys {
+				// Fetch all items from list (inefficient for large lists but STM is short by definition)
+				items, _ := m.stmStore.LRange(ctx, key, 0, -1)
+				for _, data := range items {
+					var rec types.Record
+					if err := json.Unmarshal([]byte(data), &rec); err == nil {
+						// Filter by UserID check (redundant if key matched, but safe)
+						if filter.UserID != "" {
+							if metaUser, ok := rec.Metadata["user_id"].(string); ok && metaUser != filter.UserID {
+								continue
+							}
+						}
+						results = append(results, rec)
+					}
+				}
+			}
+		}
+	}
+
+	// 2. Fetch Staging Memory if requested
+	if filter.Type == "staging" || filter.Type == "all" || filter.Type == "" {
+		var stagingEntries []*types.StagingEntry
+		var err error
+		if filter.UserID != "" {
+			stagingEntries, err = m.stagingStore.GetAllByUser(ctx, filter.UserID)
+		} else {
+			stagingEntries, err = m.stagingStore.GetPendingEntries(ctx, 1, 0)
+		}
+
+		if err == nil {
+			for _, entry := range stagingEntries {
+				results = append(results, types.Record{
+					ID:        entry.ID,
+					Content:   entry.Content,
+					Timestamp: entry.LastSeenAt,
+					Type:      types.Staging,
+					Metadata: map[string]interface{}{
+						"category":         string(entry.Category),
+						"user_id":          entry.UserID,
+						"confidence_score": entry.ConfidenceScore,
+						"occurrence_count": entry.OccurrenceCount,
+					},
+				})
+			}
+		}
+	}
+
+	// 3. Fetch Long-Term Memory if requested
+	if filter.Type == "long_term" || filter.Type == "all" || filter.Type == "" {
+		// Call Vector Store List with filters
+		vFilters := make(map[string]interface{})
+		if filter.UserID != "" {
+			vFilters["user_id"] = filter.UserID
+		}
+		// If requesting "long_term", we want ALL records in VectorStore (LTM + Legacy Entity).
+		// VectorStore does not contain ShortTerm.
+		// So we only apply specific type filter if it's NOT long_term (and NOT all).
+		if filter.Type != "" && filter.Type != "all" && filter.Type != "long_term" {
+			vFilters["type"] = filter.Type
+		}
+
+		// For LTM, we use the store's pagination if we are ONLY fetching LTM.
+		// If we are mixing (All), pagination becomes complex (STM + LTM).
+		// For MVP:
+		// If Type == "long_term", we rely on store pagination.
+		// If Type == "all" or "short_term", we fetch and paginate in memory (since we have to merge STM).
+
+		if filter.Type == "long_term" {
+			ltmRecs, err := m.vectorStore.List(ctx, vFilters, filter.Limit, offset)
+			if err != nil {
+				return nil, err
+			}
+			results = append(results, ltmRecs...)
+			// If we are only doing LTM, we are done (assuming store handled offset)
+			// But wait, List return type is []Record.
+			return results, nil
+		} else {
+			// "all" or "short_term" mixed with LTM?
+			// If "all", we fetch LTM too, but without offset/limit at store level? No, that's too heavy.
+			// Strategy: Fetch LTM page 1 (or up to limit?)
+			// If we blend, standard pagination is hard.
+			// Simplified approach for "all":
+			// Fetch STM.
+			// Fetch LTM (with limit).
+			// Combine, Sort by Timestamp Descending.
+			// Slice options.
+
+			// We'll fetch LTM with loose limit (e.g. limit + offset) just in case?
+			// Or just simple: STM is usually small.
+			// Let's Load STM, then append LTM.
+
+			// If Filter is "all", we fetch LTM as well.
+			if filter.Type == "all" || filter.Type == "" {
+				ltmRecs, err := m.vectorStore.List(ctx, vFilters, filter.Limit+offset, 0) // Fetch from 0 to needed count
+				if err == nil {
+					results = append(results, ltmRecs...)
+				}
+			}
+		}
+	}
+
+	// 3. In-Memory Sort and Paginate (for merged results)
+	// Sort by Timestamp Descending
+	// (Assuming we want newest first)
+	// Import "sort" is needed? Manager file imports.
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Timestamp.After(results[j].Timestamp)
+	})
+
+	// Pagination
+	total := len(results)
+	if offset >= total {
+		return []types.Record{}, nil
+	}
+	end := offset + filter.Limit
+	if end > total {
+		end = total
+	}
+
+	// Slice
+	return results[offset:end], nil
+}
+
+// Update modifies a memory record.
+func (m *Manager) Update(ctx context.Context, id string, newContent string) error {
+	var rec *types.Record
+	var isLTM bool
+
+	// 1. Try LTM
+	if r, err := m.vectorStore.Get(ctx, id); err == nil {
+		rec = r
+		isLTM = true
+	} else {
+		// 2. Try STM
+		if r, err := m.stmStore.Get(ctx, id); err == nil {
+			rec = r
+			isLTM = false
+		} else {
+			return fmt.Errorf("record not found in LTM or STM")
+		}
+	}
+
+	// 3. Re-embed
+	// STM also uses embeddings in our 'Add' logic, so we should update it.
+	vector, err := m.embedder.EmbedQuery(ctx, newContent)
+	if err != nil {
+		return fmt.Errorf("failed to embed new content: %w", err)
+	}
+
+	// 4. Update fields
+	rec.Content = newContent
+	rec.Embedding = vector
+	// Keep Timestamp
+
+	// 5. Save
+	if isLTM {
+		if err := m.vectorStore.Update(ctx, *rec); err != nil {
+			return fmt.Errorf("failed to update LTM: %w", err)
+		}
+	} else {
+		if err := m.stmStore.Update(ctx, *rec); err != nil {
+			return fmt.Errorf("failed to update STM: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// Delete removes a record from LTM by ID.
+func (m *Manager) Delete(ctx context.Context, id string) error {
+	return m.vectorStore.Delete(ctx, []string{id})
+}
+
+// Clear resets both stores.
+func (m *Manager) Clear(ctx context.Context, userID string, sessionID string) error {
+	key := fmt.Sprintf("memory:stm:%s:%s", userID, sessionID)
+	if err := m.stmStore.Del(ctx, key); err != nil {
+		return err
+	}
+	logger.System("STM cleared", "user_id", userID, "session_id", sessionID)
+	return nil
+}
+
+// GetUsers returns list of end users с stats.
+func (m *Manager) GetUsers(ctx context.Context) ([]types.EndUser, error) {
+	if m.endUserStore == nil {
+		return nil, fmt.Errorf("end user store not initialized")
+	}
+
+	// 1. Fetch Users from MySQL
+	users, err := m.endUserStore.ListUsers(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// 2. Enrich with Stats
+	for i := range users {
+		u := &users[i]
+
+		// STM Sessions Count
+		// Pattern: memory:stm:<UserID>:*
+		pattern := fmt.Sprintf("memory:stm:%s:*", u.UserIdentifier)
+		keys, _ := m.stmStore.ScanKeys(ctx, pattern)
+		u.SessionCount = len(keys)
+
+		// LTM Count
+		count, _ := m.vectorStore.Count(ctx, map[string]interface{}{"user_id": u.UserIdentifier})
+		u.LTMCount = int(count)
+	}
+
+	return users, nil
+}
+
+// GetSystemStatus returns basic health info.
+func (m *Manager) GetSystemStatus(ctx context.Context) map[string]string {
+	status := make(map[string]string)
+
+	// Check STM
+	if _, err := m.stmStore.ScanKeys(ctx, "test"); err != nil {
+		status["ShortTermMemory"] = "Down"
+	} else {
+		status["ShortTermMemory"] = "Online"
+	}
+
+	// Check LTM
+	if _, err := m.vectorStore.List(ctx, map[string]interface{}{}, 1, 0); err != nil {
+		status["LongTermMemory"] = "Down / Error"
+	} else {
+		status["LongTermMemory"] = "Online"
+	}
+
+	return status
+}
+
+// GetRecentAlerts 获取最近的告警记录（供API调用）
+func (m *Manager) GetRecentAlerts(limit int) []Alert {
+	if m.alertEngine == nil {
+		return []Alert{}
+	}
+	return m.alertEngine.GetRecentAlerts(limit)
+}
+
+// QueryAlerts 查询告警
+func (m *Manager) QueryAlerts(ctx context.Context, level, rule string, limit, offset int) ([]Alert, int, error) {
+	if m.alertEngine == nil {
+		return nil, 0, fmt.Errorf("alert engine not initialized")
+	}
+	return m.alertEngine.QueryAlerts(ctx, level, rule, limit, offset)
+}
+
+// DeleteAlert 删除告警
+func (m *Manager) DeleteAlert(ctx context.Context, id string) error {
+	if m.alertEngine == nil {
+		return fmt.Errorf("alert engine not initialized")
+	}
+	return m.alertEngine.DeleteAlert(ctx, id)
+}
+
+// CreateAlert 创建告警
+func (m *Manager) CreateAlert(ctx context.Context, alert Alert) error {
+	if m.alertEngine == nil {
+		return fmt.Errorf("alert engine not initialized")
+	}
+	return m.alertEngine.CreateAlert(ctx, alert)
+}
+
+// SetAlertNotifier 设置告警通知器
+func (m *Manager) SetAlertNotifier(notifier *AlertNotifier) {
+	if m.alertEngine != nil {
+		m.alertEngine.SetNotifyFunc(func(alert *Alert) {
+			notifier.Notify(alert)
+		})
+	}
+}
